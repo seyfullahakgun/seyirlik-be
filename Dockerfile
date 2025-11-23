@@ -1,0 +1,13 @@
+# Aşama 1: Uygulamayı Derle
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /seyirlik_api ./cmd/main.go 
+
+# Aşama 2: Çalıştırma Ortamı
+FROM alpine:latest
+COPY --from=builder /seyirlik_api /usr/local/bin/
+CMD ["/usr/local/bin/seyirlik_api"]
