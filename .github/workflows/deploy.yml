@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - preprod
-      - feature/** # Özellik geliştirme dalları
+      - feature/**
 
 jobs:
   build_and_deploy:
@@ -15,16 +15,13 @@ jobs:
       - uses: actions/checkout@v4
       
       # 1. Docker Hub'a Giriş
-      
-     # 🚨 DÜZELTME BAŞLANGICI
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          registry: docker.io # 👈 Bu satır, Docker Hub'ın adresini açıkça belirtir.
-      # 🚨 DÜZELTME BİTİŞİ
-
+          registry: docker.io
+          
       # 2. Ortam ve TAG Değişkenlerini Ayarlama
       - name: Set Environment Variables
         id: set_vars
@@ -43,11 +40,11 @@ jobs:
       - name: Build and Push Backend Image
         uses: docker/build-push-action@v5
         with:
-          context: . # Repo'nun kökü (Go kodu burada)
+          context: .
           file: ./Dockerfile
           push: true
-          # İmaj etiketi: KullanıcıAdı/seyirlik-api:tag_adı
-          tags: ${{ secrets.DOCKER_USERNAME }}/seyirlik-api:${{ env.DOCKER_TAG }}
+          # 🚨 DÜZELTME: İmaj adı seyirlik-be olarak değiştirildi
+          tags: ${{ secrets.DOCKER_USERNAME }}/seyirlik-be:${{ env.DOCKER_TAG }}
 
       # 4. Hetzner'a Dağıtım (Deploy)
       - name: Deploy to Server via SSH
@@ -59,14 +56,14 @@ jobs:
           script: |
             cd /home/${{ secrets.SSH_USERNAME }}/seyirlik_infra
             
-            # 🚨 Buradaki değişkenler sunucudaki .env'deki bilgileri kullanır.
-            # Sadece TAG bilgisini Workflow'dan alıyoruz.
-            export TAG=${{ env.DOCKER_TAG }}
-
+            # 🚨 DÜZELTME: 'export TAG' satırını kaldırıp değişkeni komuta taşıyoruz.
+            # sudo'nun TAG değişkenini görmesi için en garanti yöntem budur.
+            
             echo "CI/CD: Backend imajı çekiliyor ve servis güncelleniyor..."
             
-            # docker-compose.yml içinde image tag'i ${TAG}'den okunacak
-            sudo docker-compose pull api 
-            sudo docker-compose up -d --no-deps api 
+            # TAG değişkenini sudo'ya geçirerek pull ve up komutlarını çalıştır.
+            # Konteyner adı da API yerine BE olarak değiştirildi.
+            sudo TAG=${{ env.DOCKER_TAG }} docker-compose pull seyirlik_be 
+            sudo TAG=${{ env.DOCKER_TAG }} docker-compose up -d --no-deps seyirlik_be
             
             echo "Dağıtım başarılı: ${{ env.TARGET_DOMAIN }}"
