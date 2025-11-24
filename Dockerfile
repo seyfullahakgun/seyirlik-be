@@ -5,10 +5,9 @@ COPY go.mod .
 COPY go.sum .
 RUN go mod tidy
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /seyirlik_api ./cmd/main.go 
+RUN CGO_ENABLED=0 GOOS=linux go build -o /seyirlik_be ./cmd/main.go 
 
 # Aşama 2: Çalıştırma Ortamı
 FROM alpine:latest
-COPY --from=builder /seyirlik_api /usr/local/bin/
-CMD ["/usr/local/bin/seyirlik_api"]
-    
+COPY --from=builder /seyirlik_be /usr/local/bin/
+CMD ["/usr/local/bin/seyirlik_be"]
