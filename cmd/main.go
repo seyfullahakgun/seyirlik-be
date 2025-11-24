@@ -9,7 +9,7 @@ import (
 
 func main() {
 	// Ping/Health Check endpoint'i ekleme
-	http.HandleFunc("/api/ping", handlePing)
+	http.HandleFunc("/ping", handlePing)
 
 	// Diğer tüm route'larınız burada tanımlanır.
 	// http.HandleFunc("/api/movies", handleMovies)
