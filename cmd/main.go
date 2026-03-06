@@ -34,7 +34,7 @@ func main() {
 	e.Use(middleware.Recover())
 	// Frontend'den gelen isteklere izin ver (CORS)
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins: []string{"http://localhost:3000", "http://localhost:5173", "https://seyirlik.net"},
+		AllowOrigins: []string{"http://localhost:3000", "http://localhost:5173", "https://seyirlik.net", "https://www.seyirlik.net"},
 		AllowMethods: []string{"GET"},
 	}))
 
