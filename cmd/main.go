@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"seyirlik.net/api/internal/config"
 	"seyirlik.net/api/internal/handlers"
@@ -23,7 +29,7 @@ func main() {
 	tmdbService := services.NewTMDBService(cfg.TMDBApiKey)
 
 	// 3. Handler'ı oluştur, servisi içine ver
-	movieHandler := handlers.NewMovieHandler(tmdbService)
+	h := handlers.NewHandler(tmdbService)
 
 	// 4. Echo sunucusunu başlat
 	e := echo.New()
@@ -38,16 +44,49 @@ func main() {
 		AllowMethods: []string{"GET"},
 	}))
 
-	// 5. Route'ları tanımla
-	api := e.Group("/api")
-	api.GET("/search", movieHandler.Search)
-	api.GET("/movie/:id", movieHandler.GetDetail)
-	api.GET("/movie/:id/watch-providers", movieHandler.GetWatchProviders)
-	api.GET("/movie/:id/credits", movieHandler.GetCredits)
+	// 5. Health check endpoint
+	e.GET("/health", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{
+			"status": "ok",
+		})
+	})
 
-	// 6. Sunucuyu başlat
-	log.Printf("Sunucu :%s portunda çalışıyor...", cfg.Port)
-	if err := e.Start(":" + cfg.Port); err != nil {
-		log.Fatal(err)
+	// 6. Route'ları tanımla
+	api := e.Group("/api")
+	api.GET("/search", h.Search) // Multi search: film + dizi
+
+	// Film endpoint'leri
+	api.GET("/movie/:id", h.GetDetail)
+	api.GET("/movie/:id/watch-providers", h.GetWatchProviders)
+	api.GET("/movie/:id/credits", h.GetCredits)
+
+	// Dizi endpoint'leri
+	api.GET("/tv/:id", h.GetTVDetail)
+	api.GET("/tv/:id/watch-providers", h.GetTVWatchProviders)
+	api.GET("/tv/:id/credits", h.GetTVCredits)
+
+	// 7. Sunucuyu başlat (goroutine içinde)
+	log.Printf("Sunucu :%s portunda başlatılıyor...", cfg.Port)
+	go func() {
+		if err := e.Start(":" + cfg.Port); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Sunucu hatası: %v", err)
+		}
+	}()
+
+	// Shutdown sinyallerini dinle
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Sunucu kapatılıyor...")
+
+	// 10 saniye içinde mevcut istekleri tamamla
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := e.Shutdown(ctx); err != nil {
+		log.Fatalf("Sunucu kapatma hatası: %v", err)
 	}
+
+	log.Println("Sunucu başarıyla kapatıldı")
 }

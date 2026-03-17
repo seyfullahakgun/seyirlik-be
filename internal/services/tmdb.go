@@ -1,47 +1,95 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
+	"seyirlik.net/api/internal/cache"
 	"seyirlik.net/api/internal/models"
 )
 
+// Hata tanımlamaları
+var (
+	ErrNotFound = errors.New("içerik bulunamadı")
+)
+
+// Cache TTL süreleri
+const (
+	searchCacheTTL = 5 * time.Minute  // Arama sonuçları 5 dakika
+	detailCacheTTL = 30 * time.Minute // Detay bilgileri 30 dakika
+)
+
+// TMDBClient TMDB servisinin interface'i - test edilebilirlik için
+type TMDBClient interface {
+	// Arama
+	SearchMulti(ctx context.Context, query string, page int) (*models.MultiSearchResponse, error)
+
+	// Film
+	GetMovieDetail(ctx context.Context, id int) (*models.Movie, error)
+	GetWatchProviders(ctx context.Context, id int) (*models.WatchProviderResult, error)
+	GetCredits(ctx context.Context, id int) (*models.Credits, error)
+
+	// Dizi
+	GetTVDetail(ctx context.Context, id int) (*models.TVShow, error)
+	GetTVWatchProviders(ctx context.Context, id int) (*models.WatchProviderResult, error)
+	GetTVCredits(ctx context.Context, id int) (*models.Credits, error)
+}
+
+// TMDBService interface'i implemente eder
+var _ TMDBClient = (*TMDBService)(nil)
+
 type TMDBService struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
-	imageBase  string
+	apiKey      string
+	baseURL     string
+	httpClient  *http.Client
+	imageBase   string
+	searchCache *cache.Cache
+	detailCache *cache.Cache
 }
 
 // Yeni bir TMDBService oluşturur
 func NewTMDBService(apiKey string) *TMDBService {
 	return &TMDBService{
-		apiKey:     apiKey,
-		baseURL:    "https://api.themoviedb.org/3",
-		httpClient: &http.Client{},
-		imageBase:  "https://image.tmdb.org/t/p/w500",
+		apiKey:  apiKey,
+		baseURL: "https://api.themoviedb.org/3",
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		imageBase:   "https://image.tmdb.org/t/p/w500",
+		searchCache: cache.New(searchCacheTTL),
+		detailCache: cache.New(detailCacheTTL),
 	}
 }
 
 // TMDB'ye GET isteği atan yardımcı fonksiyon
 // Her endpoint için tekrar tekrar aynı kodu yazmamak için
-func (s *TMDBService) get(endpoint string, params url.Values) ([]byte, error) {
+func (s *TMDBService) get(ctx context.Context, endpoint string, params url.Values) ([]byte, error) {
 	// API key'i her isteğe otomatik ekle
 	params.Set("api_key", s.apiKey)
 	params.Set("language", "tr-TR") // Türkçe içerik
 
 	fullURL := fmt.Sprintf("%s%s?%s", s.baseURL, endpoint, params.Encode())
 
-	resp, err := s.httpClient.Get(fullURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("istek oluşturma hatası: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("istek hatası: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("TMDB hata kodu: %d", resp.StatusCode)
 	}
@@ -50,12 +98,12 @@ func (s *TMDBService) get(endpoint string, params url.Values) ([]byte, error) {
 }
 
 // Film arama — /search?q=inception
-func (s *TMDBService) SearchMovies(query string, page int) (*models.SearchResponse, error) {
+func (s *TMDBService) SearchMovies(ctx context.Context, query string, page int) (*models.SearchResponse, error) {
 	params := url.Values{}
 	params.Set("query", query)
 	params.Set("page", fmt.Sprintf("%d", page))
 
-	body, err := s.get("/search/movie", params)
+	body, err := s.get(ctx, "/search/movie", params)
 	if err != nil {
 		return nil, err
 	}
@@ -75,9 +123,68 @@ func (s *TMDBService) SearchMovies(query string, page int) (*models.SearchRespon
 	return &result, nil
 }
 
+// Multi search — Film ve dizi birlikte arama
+func (s *TMDBService) SearchMulti(ctx context.Context, query string, page int) (*models.MultiSearchResponse, error) {
+	// Cache key oluştur
+	cacheKey := fmt.Sprintf("search:%s:%d", query, page)
+
+	// Cache'de var mı kontrol et
+	if cached, found := s.searchCache.Get(cacheKey); found {
+		return cached.(*models.MultiSearchResponse), nil
+	}
+
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("page", fmt.Sprintf("%d", page))
+
+	body, err := s.get(ctx, "/search/multi", params)
+	if err != nil {
+		return nil, err
+	}
+
+	var result models.MultiSearchResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("JSON parse hatası: %w", err)
+	}
+
+	// Sadece film ve dizi sonuçlarını filtrele (person'ları çıkar)
+	filtered := make([]models.MultiSearchItem, 0, len(result.Results))
+	for i := range result.Results {
+		item := &result.Results[i]
+
+		// Sadece movie ve tv tiplerini al
+		if item.MediaType != "movie" && item.MediaType != "tv" {
+			continue
+		}
+
+		// Poster URL'lerini tam hale getir
+		if item.PosterPath != "" {
+			item.PosterPath = s.imageBase + item.PosterPath
+		}
+		if item.BackdropPath != "" {
+			item.BackdropPath = "https://image.tmdb.org/t/p/w1280" + item.BackdropPath
+		}
+
+		filtered = append(filtered, *item)
+	}
+
+	result.Results = filtered
+
+	// Cache'e kaydet
+	s.searchCache.Set(cacheKey, &result)
+
+	return &result, nil
+}
+
 // Film detayı — /movie/123
-func (s *TMDBService) GetMovieDetail(id int) (*models.Movie, error) {
-	body, err := s.get(fmt.Sprintf("/movie/%d", id), url.Values{})
+func (s *TMDBService) GetMovieDetail(ctx context.Context, id int) (*models.Movie, error) {
+	cacheKey := fmt.Sprintf("movie:%d", id)
+
+	if cached, found := s.detailCache.Get(cacheKey); found {
+		return cached.(*models.Movie), nil
+	}
+
+	body, err := s.get(ctx, fmt.Sprintf("/movie/%d", id), url.Values{})
 	if err != nil {
 		return nil, err
 	}
@@ -94,17 +201,21 @@ func (s *TMDBService) GetMovieDetail(id int) (*models.Movie, error) {
 		movie.BackdropPath = "https://image.tmdb.org/t/p/w1280" + movie.BackdropPath
 	}
 
+	s.detailCache.Set(cacheKey, &movie)
+
 	return &movie, nil
 }
 
-// Hangi platformda var — /movie/123/watch-providers
-func (s *TMDBService) GetWatchProviders(id int) (*models.WatchProviderResult, error) {
-	body, err := s.get(fmt.Sprintf("/movie/%d/watch/providers", id), url.Values{})
+// ==================== ORTAK YARDIMCI FONKSİYONLAR ====================
+
+// getWatchProviders - Film veya dizi için izleme platformlarını getirir
+// mediaType: "movie" veya "tv"
+func (s *TMDBService) getWatchProviders(ctx context.Context, mediaType string, id int) (*models.WatchProviderResult, error) {
+	body, err := s.get(ctx, fmt.Sprintf("/%s/%d/watch/providers", mediaType, id), url.Values{})
 	if err != nil {
 		return nil, err
 	}
 
-	// TMDB ülke bazlı döner: { results: { TR: { flatrate: [...] } } }
 	var raw struct {
 		Results map[string]*models.WatchProviderResult `json:"results"`
 	}
@@ -115,7 +226,7 @@ func (s *TMDBService) GetWatchProviders(id int) (*models.WatchProviderResult, er
 	// Sadece Türkiye verisini döndür
 	tr := raw.Results["TR"]
 	if tr == nil {
-		return &models.WatchProviderResult{}, nil // TR'de yoksa boş döner
+		return &models.WatchProviderResult{}, nil
 	}
 
 	// Platform logolarını tam URL yap
@@ -126,9 +237,10 @@ func (s *TMDBService) GetWatchProviders(id int) (*models.WatchProviderResult, er
 	return tr, nil
 }
 
-// Oyuncular ve yönetmen — /movie/123/credits
-func (s *TMDBService) GetCredits(id int) (*models.Credits, error) {
-	body, err := s.get(fmt.Sprintf("/movie/%d/credits", id), url.Values{})
+// getCredits - Film veya dizi için oyuncu/ekip bilgilerini getirir
+// mediaType: "movie" veya "tv"
+func (s *TMDBService) getCredits(ctx context.Context, mediaType string, id int) (*models.Credits, error) {
+	body, err := s.get(ctx, fmt.Sprintf("/%s/%d/credits", mediaType, id), url.Values{})
 	if err != nil {
 		return nil, err
 	}
@@ -146,4 +258,58 @@ func (s *TMDBService) GetCredits(id int) (*models.Credits, error) {
 	}
 
 	return &credits, nil
+}
+
+// ==================== FİLM FONKSİYONLARI ====================
+
+// Film için izleme platformları — /movie/123/watch-providers
+func (s *TMDBService) GetWatchProviders(ctx context.Context, id int) (*models.WatchProviderResult, error) {
+	return s.getWatchProviders(ctx, "movie", id)
+}
+
+// Film oyuncuları — /movie/123/credits
+func (s *TMDBService) GetCredits(ctx context.Context, id int) (*models.Credits, error) {
+	return s.getCredits(ctx, "movie", id)
+}
+
+// ==================== TV SHOW (DİZİ) FONKSİYONLARI ====================
+
+// Dizi detayı — /tv/123
+func (s *TMDBService) GetTVDetail(ctx context.Context, id int) (*models.TVShow, error) {
+	cacheKey := fmt.Sprintf("tv:%d", id)
+
+	if cached, found := s.detailCache.Get(cacheKey); found {
+		return cached.(*models.TVShow), nil
+	}
+
+	body, err := s.get(ctx, fmt.Sprintf("/tv/%d", id), url.Values{})
+	if err != nil {
+		return nil, err
+	}
+
+	var tv models.TVShow
+	if err := json.Unmarshal(body, &tv); err != nil {
+		return nil, fmt.Errorf("JSON parse hatası: %w", err)
+	}
+
+	if tv.PosterPath != "" {
+		tv.PosterPath = s.imageBase + tv.PosterPath
+	}
+	if tv.BackdropPath != "" {
+		tv.BackdropPath = "https://image.tmdb.org/t/p/w1280" + tv.BackdropPath
+	}
+
+	s.detailCache.Set(cacheKey, &tv)
+
+	return &tv, nil
+}
+
+// Dizi için izleme platformları — /tv/123/watch-providers
+func (s *TMDBService) GetTVWatchProviders(ctx context.Context, id int) (*models.WatchProviderResult, error) {
+	return s.getWatchProviders(ctx, "tv", id)
+}
+
+// Dizi oyuncuları — /tv/123/credits
+func (s *TMDBService) GetTVCredits(ctx context.Context, id int) (*models.Credits, error) {
+	return s.getCredits(ctx, "tv", id)
 }
