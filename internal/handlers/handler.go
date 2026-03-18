@@ -4,12 +4,16 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"seyirlik.net/api/internal/models"
 	"seyirlik.net/api/internal/services"
 
 	"github.com/labstack/echo/v4"
 )
+
+// Uygulama başlangıç zamanı (uptime için)
+var startTime = time.Now()
 
 // Sayfa limitleri
 const (
@@ -32,6 +36,22 @@ func errorResponse(c echo.Context, status int, code, message string) error {
 		Code:    code,
 		Message: message,
 	})
+}
+
+// handleTMDBError TMDB servis hatalarını HTTP yanıtına çevirir
+func handleTMDBError(c echo.Context, err error, notFoundMsg string) error {
+	switch {
+	case errors.Is(err, services.ErrNotFound):
+		return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, notFoundMsg)
+	case errors.Is(err, services.ErrRateLimit):
+		return errorResponse(c, http.StatusTooManyRequests, models.ErrCodeRateLimit, "Çok fazla istek yapıldı, lütfen bekleyin")
+	case errors.Is(err, services.ErrServerError):
+		return errorResponse(c, http.StatusBadGateway, models.ErrCodeExternalAPI, "TMDB servisi şu anda kullanılamıyor")
+	case errors.Is(err, services.ErrBadRequest):
+		return errorResponse(c, http.StatusBadRequest, models.ErrCodeBadRequest, "Geçersiz istek")
+	default:
+		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, "Beklenmeyen bir hata oluştu")
+	}
 }
 
 // ID parametresini parse eder ve validate eder
@@ -73,7 +93,7 @@ func (h *Handler) Search(c echo.Context) error {
 
 	result, err := h.tmdb.SearchMulti(c.Request().Context(), query, page)
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Arama sonucu bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, result)
@@ -88,10 +108,7 @@ func (h *Handler) GetDetail(c echo.Context) error {
 
 	movie, err := h.tmdb.GetMovieDetail(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Film bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Film bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, movie)
@@ -106,10 +123,7 @@ func (h *Handler) GetWatchProviders(c echo.Context) error {
 
 	providers, err := h.tmdb.GetWatchProviders(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Film bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Film bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, providers)
@@ -124,10 +138,7 @@ func (h *Handler) GetCredits(c echo.Context) error {
 
 	credits, err := h.tmdb.GetCredits(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Film bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Film bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, credits)
@@ -144,10 +155,7 @@ func (h *Handler) GetTVDetail(c echo.Context) error {
 
 	tv, err := h.tmdb.GetTVDetail(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Dizi bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Dizi bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, tv)
@@ -162,10 +170,7 @@ func (h *Handler) GetTVWatchProviders(c echo.Context) error {
 
 	providers, err := h.tmdb.GetTVWatchProviders(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Dizi bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Dizi bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, providers)
@@ -180,11 +185,49 @@ func (h *Handler) GetTVCredits(c echo.Context) error {
 
 	credits, err := h.tmdb.GetTVCredits(c.Request().Context(), id)
 	if err != nil {
-		if errors.Is(err, services.ErrNotFound) {
-			return errorResponse(c, http.StatusNotFound, models.ErrCodeNotFound, "Dizi bulunamadı")
-		}
-		return errorResponse(c, http.StatusInternalServerError, models.ErrCodeExternalAPI, err.Error())
+		return handleTMDBError(c, err, "Dizi bulunamadı")
 	}
 
 	return c.JSON(http.StatusOK, credits)
+}
+
+// ==================== HEALTH CHECK ====================
+
+// HealthResponse health check yanıtı
+type HealthResponse struct {
+	Status    string              `json:"status"`
+	Uptime    string              `json:"uptime"`
+	TMDB      string              `json:"tmdb"`
+	Cache     services.CacheStats `json:"cache"`
+	Timestamp string              `json:"timestamp"`
+}
+
+// HealthCheck detaylı sağlık kontrolü
+func (h *Handler) HealthCheck(c echo.Context) error {
+	// TMDB bağlantısını kontrol et
+	tmdbStatus := "ok"
+	if err := h.tmdb.Ping(c.Request().Context()); err != nil {
+		tmdbStatus = "error"
+	}
+
+	// Cache istatistikleri
+	cacheStats := h.tmdb.GetCacheStats()
+
+	// Uptime hesapla
+	uptime := time.Since(startTime).Round(time.Second).String()
+
+	response := HealthResponse{
+		Status:    "ok",
+		Uptime:    uptime,
+		TMDB:      tmdbStatus,
+		Cache:     cacheStats,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// TMDB down ise status'u degraded yap
+	if tmdbStatus != "ok" {
+		response.Status = "degraded"
+	}
+
+	return c.JSON(http.StatusOK, response)
 }

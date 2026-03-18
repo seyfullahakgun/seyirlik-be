@@ -8,9 +8,11 @@ type APIError struct {
 
 // Hata kodları
 const (
-	ErrCodeBadRequest     = "BAD_REQUEST"
-	ErrCodeNotFound       = "NOT_FOUND"
-	ErrCodeInternalError  = "INTERNAL_ERROR"
-	ErrCodeValidation     = "VALIDATION_ERROR"
-	ErrCodeExternalAPI    = "EXTERNAL_API_ERROR"
+	ErrCodeBadRequest = "BAD_REQUEST"
+	ErrCodeNotFound   = "NOT_FOUND"
+	//	ErrCodeInternalError = "INTERNAL_ERROR"
+	ErrCodeValidation  = "VALIDATION_ERROR"
+	ErrCodeExternalAPI = "EXTERNAL_API_ERROR"
+	ErrCodeRateLimit   = "RATE_LIMIT_EXCEEDED"
+	//	ErrCodeTimeout       = "REQUEST_TIMEOUT"
 )

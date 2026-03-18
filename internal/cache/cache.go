@@ -2,6 +2,7 @@ package cache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,11 +12,20 @@ type CacheItem struct {
 	Expiration int64
 }
 
+// Stats cache istatistiklerini tutar
+type Stats struct {
+	Hits   uint64 `json:"hits"`
+	Misses uint64 `json:"misses"`
+	Items  int    `json:"items"`
+}
+
 // Cache thread-safe in-memory cache
 type Cache struct {
-	items map[string]CacheItem
-	mu    sync.RWMutex
-	ttl   time.Duration
+	items  map[string]CacheItem
+	mu     sync.RWMutex
+	ttl    time.Duration
+	hits   uint64
+	misses uint64
 }
 
 // New yeni bir cache oluşturur
@@ -49,14 +59,17 @@ func (c *Cache) Get(key string) (any, bool) {
 
 	item, found := c.items[key]
 	if !found {
+		atomic.AddUint64(&c.misses, 1)
 		return nil, false
 	}
 
 	// Expire olmuş mu kontrol et
 	if time.Now().UnixNano() > item.Expiration {
+		atomic.AddUint64(&c.misses, 1)
 		return nil, false
 	}
 
+	atomic.AddUint64(&c.hits, 1)
 	return item.Value, true
 }
 
@@ -87,5 +100,18 @@ func (c *Cache) cleanup() {
 		if now > item.Expiration {
 			delete(c.items, key)
 		}
+	}
+}
+
+// GetStats cache istatistiklerini döner
+func (c *Cache) GetStats() Stats {
+	c.mu.RLock()
+	itemCount := len(c.items)
+	c.mu.RUnlock()
+
+	return Stats{
+		Hits:   atomic.LoadUint64(&c.hits),
+		Misses: atomic.LoadUint64(&c.misses),
+		Items:  itemCount,
 	}
 }

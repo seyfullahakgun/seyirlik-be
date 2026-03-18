@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,47 +12,122 @@ import (
 
 	"seyirlik.net/api/internal/config"
 	"seyirlik.net/api/internal/handlers"
+	"seyirlik.net/api/internal/middleware"
 	"seyirlik.net/api/internal/services"
 
 	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
+	echomw "github.com/labstack/echo/v4/middleware"
 )
 
 func main() {
-	// 1. Ayarları yükle (.env'den TMDB_API_KEY ve PORT okur)
+	// 1. Structured logger oluştur (JSON formatında)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	// 2. Ayarları yükle (.env'den TMDB_API_KEY ve PORT okur)
 	cfg := config.Load()
 
 	if cfg.TMDBApiKey == "" {
-		log.Fatal("TMDB_API_KEY env variable eksik!")
+		logger.Error("TMDB_API_KEY env variable eksik!")
+		os.Exit(1)
 	}
 
-	// 2. TMDB servisini oluştur
+	// 3. TMDB servisini oluştur
 	tmdbService := services.NewTMDBService(cfg.TMDBApiKey)
 
-	// 3. Handler'ı oluştur, servisi içine ver
+	// 4. Handler'ı oluştur, servisi içine ver
 	h := handlers.NewHandler(tmdbService)
 
-	// 4. Echo sunucusunu başlat
+	// 5. Echo sunucusunu başlat
 	e := echo.New()
+	e.HideBanner = true
 
-	// Loglama — her isteği terminale yazar
-	e.Use(middleware.Logger())
-	// Panic olursa sunucu çökmez, hata döner
-	e.Use(middleware.Recover())
-	// Frontend'den gelen isteklere izin ver (CORS)
-	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins: []string{"http://localhost:3000", "http://localhost:5173", "https://seyirlik.net", "https://www.seyirlik.net"},
+	// ==================== MIDDLEWARE STACK ====================
+	// Sıralama önemli: önce panic recovery, sonra request ID, sonra diğerleri
+
+	// Panic recovery — sunucu çökmez, hata loglanır
+	e.Use(echomw.RecoverWithConfig(echomw.RecoverConfig{
+		LogErrorFunc: func(c echo.Context, err error, stack []byte) error {
+			requestID := middleware.GetRequestID(c.Request().Context())
+			logger.Error("Panic recovered",
+				"request_id", requestID,
+				"error", err.Error(),
+				"stack", string(stack),
+			)
+			return nil
+		},
+	}))
+
+	// Request ID — her isteğe unique ID atar
+	e.Use(middleware.RequestID())
+
+	// Security headers — X-Content-Type-Options, X-Frame-Options vb.
+	e.Use(middleware.SecurityHeaders())
+
+	// Gzip compression — response'ları sıkıştırır
+	e.Use(echomw.GzipWithConfig(echomw.GzipConfig{
+		Level: 5, // Dengeli sıkıştırma seviyesi
+		Skipper: func(c echo.Context) bool {
+			// Health check endpoint'ini sıkıştırma
+			return c.Path() == "/health"
+		},
+	}))
+
+	// Request timeout — 30 saniye sonra timeout
+	e.Use(middleware.Timeout(30 * time.Second))
+
+	// Rate limiting — dakikada 100 istek (IP başına)
+	e.Use(echomw.RateLimiterWithConfig(echomw.RateLimiterConfig{
+		Skipper: func(c echo.Context) bool {
+			// Health check endpoint'ini rate limit'ten muaf tut
+			return c.Path() == "/health"
+		},
+		Store: echomw.NewRateLimiterMemoryStoreWithConfig(
+			echomw.RateLimiterMemoryStoreConfig{
+				Rate:      100,             // Dakikada 100 istek
+				Burst:     20,              // Ani 20 istek burst'üne izin ver
+				ExpiresIn: 1 * time.Minute, // Rate limit window
+			},
+		),
+		IdentifierExtractor: func(c echo.Context) (string, error) {
+			return c.RealIP(), nil
+		},
+		ErrorHandler: func(c echo.Context, err error) error {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{
+				"code":    "RATE_LIMIT_EXCEEDED",
+				"message": "Çok fazla istek yapıldı, lütfen bekleyin",
+			})
+		},
+		DenyHandler: func(c echo.Context, identifier string, err error) error {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{
+				"code":    "RATE_LIMIT_EXCEEDED",
+				"message": "Çok fazla istek yapıldı, lütfen bekleyin",
+			})
+		},
+	}))
+
+	// CORS — Frontend'den gelen isteklere izin ver
+	e.Use(echomw.CORSWithConfig(echomw.CORSConfig{
+		AllowOrigins: []string{
+			"http://localhost:3000",
+			"http://localhost:5173",
+			"https://seyirlik.net",
+			"https://www.seyirlik.net",
+		},
 		AllowMethods: []string{"GET"},
 	}))
 
-	// 5. Health check endpoint
-	e.GET("/health", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]string{
-			"status": "ok",
-		})
-	})
+	// Request logger — her isteği loglar (en son, böylece response bilgisi de var)
+	e.Use(middleware.SlogLogger(logger))
 
-	// 6. Route'ları tanımla
+	// ==================== ROUTES ====================
+
+	// Health check endpoint (detaylı)
+	e.GET("/health", h.HealthCheck)
+
+	// API routes
 	api := e.Group("/api")
 	api.GET("/search", h.Search) // Multi search: film + dizi
 
@@ -65,11 +141,13 @@ func main() {
 	api.GET("/tv/:id/watch-providers", h.GetTVWatchProviders)
 	api.GET("/tv/:id/credits", h.GetTVCredits)
 
-	// 7. Sunucuyu başlat (goroutine içinde)
-	log.Printf("Sunucu :%s portunda başlatılıyor...", cfg.Port)
+	// ==================== SERVER START ====================
+
+	logger.Info("Sunucu başlatılıyor", "port", cfg.Port)
 	go func() {
-		if err := e.Start(":" + cfg.Port); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Sunucu hatası: %v", err)
+		if err := e.Start(":" + cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Sunucu hatası", "error", err.Error())
+			os.Exit(1)
 		}
 	}()
 
@@ -78,15 +156,16 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Sunucu kapatılıyor...")
+	logger.Info("Sunucu kapatılıyor...")
 
 	// 10 saniye içinde mevcut istekleri tamamla
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := e.Shutdown(ctx); err != nil {
-		log.Fatalf("Sunucu kapatma hatası: %v", err)
+		logger.Error("Sunucu kapatma hatası", "error", err.Error())
+		os.Exit(1)
 	}
 
-	log.Println("Sunucu başarıyla kapatıldı")
+	logger.Info("Sunucu başarıyla kapatıldı")
 }

@@ -16,7 +16,10 @@ import (
 
 // Hata tanımlamaları
 var (
-	ErrNotFound = errors.New("içerik bulunamadı")
+	ErrNotFound    = errors.New("içerik bulunamadı")
+	ErrRateLimit   = errors.New("TMDB istek limiti aşıldı")
+	ErrServerError = errors.New("TMDB sunucu hatası")
+	ErrBadRequest  = errors.New("geçersiz istek")
 )
 
 // Cache TTL süreleri
@@ -24,6 +27,12 @@ const (
 	searchCacheTTL = 5 * time.Minute  // Arama sonuçları 5 dakika
 	detailCacheTTL = 30 * time.Minute // Detay bilgileri 30 dakika
 )
+
+// CacheStats cache istatistiklerini tutar
+type CacheStats struct {
+	Search cache.Stats `json:"search"`
+	Detail cache.Stats `json:"detail"`
+}
 
 // TMDBClient TMDB servisinin interface'i - test edilebilirlik için
 type TMDBClient interface {
@@ -39,6 +48,10 @@ type TMDBClient interface {
 	GetTVDetail(ctx context.Context, id int) (*models.TVShow, error)
 	GetTVWatchProviders(ctx context.Context, id int) (*models.WatchProviderResult, error)
 	GetTVCredits(ctx context.Context, id int) (*models.Credits, error)
+
+	// Health check
+	Ping(ctx context.Context) error
+	GetCacheStats() CacheStats
 }
 
 // TMDBService interface'i implemente eder
@@ -85,12 +98,27 @@ func (s *TMDBService) get(ctx context.Context, endpoint string, params url.Value
 	if err != nil {
 		return nil, fmt.Errorf("istek hatası: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
 
-	if resp.StatusCode == http.StatusNotFound {
+		}
+	}(resp.Body)
+
+	// HTTP status code'a göre hata döndür
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// OK, devam et
+	case http.StatusNotFound:
 		return nil, ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
+	case http.StatusTooManyRequests:
+		return nil, ErrRateLimit
+	case http.StatusBadRequest:
+		return nil, ErrBadRequest
+	default:
+		if resp.StatusCode >= 500 {
+			return nil, ErrServerError
+		}
 		return nil, fmt.Errorf("TMDB hata kodu: %d", resp.StatusCode)
 	}
 
@@ -312,4 +340,21 @@ func (s *TMDBService) GetTVWatchProviders(ctx context.Context, id int) (*models.
 // Dizi oyuncuları — /tv/123/credits
 func (s *TMDBService) GetTVCredits(ctx context.Context, id int) (*models.Credits, error) {
 	return s.getCredits(ctx, "tv", id)
+}
+
+// ==================== HEALTH CHECK ====================
+
+// Ping TMDB API'sine bağlantıyı test eder
+func (s *TMDBService) Ping(ctx context.Context) error {
+	// Basit bir endpoint'e istek at
+	_, err := s.get(ctx, "/configuration", url.Values{})
+	return err
+}
+
+// GetCacheStats cache istatistiklerini döner
+func (s *TMDBService) GetCacheStats() CacheStats {
+	return CacheStats{
+		Search: s.searchCache.GetStats(),
+		Detail: s.detailCache.GetStats(),
+	}
 }
