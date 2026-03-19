@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"seyirlik.net/api/internal/config"
+	"seyirlik.net/api/internal/database"
 	"seyirlik.net/api/internal/handlers"
 	"seyirlik.net/api/internal/middleware"
+	"seyirlik.net/api/internal/repository"
 	"seyirlik.net/api/internal/services"
 
 	"github.com/labstack/echo/v4"
@@ -34,13 +36,36 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. TMDB servisini oluştur
-	tmdbService := services.NewTMDBService(cfg.TMDBApiKey)
+	// 3. DB bağlantısını kur
+	db, err := database.New(database.Config{
+		Host:     cfg.DBHost,
+		Port:     cfg.DBPort,
+		User:     cfg.DBUser,
+		Password: cfg.DBPassword,
+		Name:     cfg.DBName,
+	})
+	if err != nil {
+		logger.Error("DB bağlantısı kurulamadı", "error", err.Error())
+		os.Exit(1)
+	}
 
-	// 4. Handler'ı oluştur, servisi içine ver
+	// 4. Tabloları oluştur
+	if err := db.Migrate(); err != nil {
+		logger.Error("DB migration hatası", "error", err.Error())
+		os.Exit(1)
+	}
+
+	// 5. Repository'leri oluştur
+	contentRepo := repository.NewContentRepository(db)
+	searchLogRepo := repository.NewSearchLogRepository(db)
+
+	// 6. TMDB servisini oluştur (repository'lerle)
+	tmdbService := services.NewTMDBService(cfg.TMDBApiKey, contentRepo, searchLogRepo)
+
+	// 7. Handler'ı oluştur, servisi içine ver
 	h := handlers.NewHandler(tmdbService)
 
-	// 5. Echo sunucusunu başlat
+	// 8. Echo sunucusunu başlat
 	e := echo.New()
 	e.HideBanner = true
 

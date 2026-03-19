@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
 
 	"seyirlik.net/api/internal/cache"
 	"seyirlik.net/api/internal/models"
+	"seyirlik.net/api/internal/repository"
 )
 
 // Hata tanımlamaları
@@ -58,25 +60,31 @@ type TMDBClient interface {
 var _ TMDBClient = (*TMDBService)(nil)
 
 type TMDBService struct {
-	apiKey      string
-	baseURL     string
-	httpClient  *http.Client
-	imageBase   string
-	searchCache *cache.Cache
-	detailCache *cache.Cache
+	apiKey        string
+	baseURL       string
+	httpClient    *http.Client
+	imageBase     string
+	searchCache   *cache.Cache
+	detailCache   *cache.Cache
+	contentRepo   *repository.ContentRepository
+	searchLogRepo *repository.SearchLogRepository
+	logger        *slog.Logger
 }
 
 // Yeni bir TMDBService oluşturur
-func NewTMDBService(apiKey string) *TMDBService {
+func NewTMDBService(apiKey string, contentRepo *repository.ContentRepository, searchLogRepo *repository.SearchLogRepository) *TMDBService {
 	return &TMDBService{
 		apiKey:  apiKey,
 		baseURL: "https://api.themoviedb.org/3",
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		imageBase:   "https://image.tmdb.org/t/p/w500",
-		searchCache: cache.New(searchCacheTTL),
-		detailCache: cache.New(detailCacheTTL),
+		imageBase:     "https://image.tmdb.org/t/p/w500",
+		searchCache:   cache.New(searchCacheTTL),
+		detailCache:   cache.New(detailCacheTTL),
+		contentRepo:   contentRepo,
+		searchLogRepo: searchLogRepo,
+		logger:        slog.Default(),
 	}
 }
 
@@ -99,10 +107,7 @@ func (s *TMDBService) get(ctx context.Context, endpoint string, params url.Value
 		return nil, fmt.Errorf("istek hatası: %w", err)
 	}
 	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
+		_ = Body.Close()
 	}(resp.Body)
 
 	// HTTP status code'a göre hata döndür
@@ -152,15 +157,37 @@ func (s *TMDBService) SearchMovies(ctx context.Context, query string, page int) 
 }
 
 // Multi search — Film ve dizi birlikte arama
+// 3 katmanlı cache: 1. Memory (5dk) → 2. DB (7 gün) → 3. TMDB API
 func (s *TMDBService) SearchMulti(ctx context.Context, query string, page int) (*models.MultiSearchResponse, error) {
-	// Cache key oluştur
 	cacheKey := fmt.Sprintf("search:%s:%d", query, page)
 
-	// Cache'de var mı kontrol et
+	// 1. In-memory cache kontrol
 	if cached, found := s.searchCache.Get(cacheKey); found {
+		s.logger.Info("Arama sonucu memory cache'den geldi", "query", query)
 		return cached.(*models.MultiSearchResponse), nil
 	}
 
+	// 2. DB'de taze veri var mı? (7 günden yeni)
+	if s.contentRepo != nil {
+		stale, err := s.contentRepo.IsStaleSearch(query)
+		if err == nil && !stale {
+			items, err := s.contentRepo.SearchInDB(query)
+			if err == nil && len(items) > 0 {
+				s.logger.Info("Arama sonucu DB'den geldi", "query", query, "count", len(items))
+				result := &models.MultiSearchResponse{
+					Page:         page,
+					Results:      items,
+					TotalResults: len(items),
+					TotalPages:   1,
+				}
+				s.searchCache.Set(cacheKey, result)
+				return result, nil
+			}
+		}
+	}
+
+	// 3. TMDB'den çek
+	s.logger.Info("Arama sonucu TMDB'den çekiliyor", "query", query)
 	params := url.Values{}
 	params.Set("query", query)
 	params.Set("page", fmt.Sprintf("%d", page))
@@ -198,7 +225,19 @@ func (s *TMDBService) SearchMulti(ctx context.Context, query string, page int) (
 
 	result.Results = filtered
 
-	// Cache'e kaydet
+	// Arka planda DB'ye kaydet ve logla
+	if s.contentRepo != nil {
+		go func() {
+			if err := s.contentRepo.BulkUpsert(result.Results); err != nil {
+				s.logger.Error("DB upsert hatası", "error", err)
+			}
+			if s.searchLogRepo != nil {
+				s.searchLogRepo.Log(query, "multi", len(result.Results))
+			}
+		}()
+	}
+
+	// Memory cache'e kaydet
 	s.searchCache.Set(cacheKey, &result)
 
 	return &result, nil

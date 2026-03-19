@@ -10,6 +10,11 @@ import (
 type Config struct {
 	TMDBApiKey string
 	Port       string
+	DBHost     string
+	DBPort     string
+	DBUser     string
+	DBPassword string
+	DBName     string
 }
 
 func Load() *Config {
@@ -22,6 +27,11 @@ func Load() *Config {
 	return &Config{
 		TMDBApiKey: os.Getenv("TMDB_API_KEY"),
 		Port:       getEnv("PORT", "8080"),
+		DBHost:     getEnv("DB_HOST", "localhost"),
+		DBPort:     getEnv("DB_PORT", "5432"),
+		DBUser:     getEnv("DB_USER", "postgres"),
+		DBPassword: os.Getenv("DB_PASSWORD"),
+		DBName:     getEnv("DB_NAME", "seyirlik"),
 	}
 }
 
